@@ -1,5 +1,5 @@
 # Python dependencies
-pyodbc==5.1.0
+pyodbc>=5.2.0
 SQLAlchemy==2.0.30
 python-dotenv==1.0.1
 requests==2.31.0        # optional: for REST-based Odoo access

@@ -6,10 +6,10 @@ services:
     container_name: jtl_sqlserver
     environment:
       ACCEPT_EULA: "Y"
-      SA_PASSWORD: "YourStrongPassword!"
+      SA_PASSWORD: "StrongPassword123!"
       MSSQL_PID: "Express"        # use Developer/Standard if you have a license
     ports:
-      - "1433:1433"
+      - "1434:1433"
     volumes:
       - jtl_data:/var/opt/mssql
       - ./backups:/backups        # drop your JTL .bak files here
