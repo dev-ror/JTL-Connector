@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    container_name: jtl_sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "YourStrongPassword!"
+      MSSQL_PID: "Express"        # use Developer/Standard if you have a license
+    ports:
+      - "1433:1433"
+    volumes:
+      - jtl_data:/var/opt/mssql
+      - ./backups:/backups        # drop your JTL .bak files here
+
+  # Optional: browser-based SQL query UI
+  adminer:
+    image: adminer:latest
+    container_name: jtl_adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - sqlserver
+
+volumes:
+  jtl_data:
+
+# ─────────────────────────────────────────────────────────────────
+# HOW TO RESTORE A JTL BACKUP:
+#
+# 1. Copy your .bak file into ./backups/
+# 2. docker exec -it jtl_sqlserver bash
+# 3. /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'YourStrongPassword!' \
+#      -Q "RESTORE DATABASE [eazybusiness] FROM DISK='/backups/your_backup.bak' \
+#          WITH MOVE 'eazybusiness' TO '/var/opt/mssql/data/eazybusiness.mdf', \
+#               MOVE 'eazybusiness_log' TO '/var/opt/mssql/data/eazybusiness_log.ldf', \
+#               REPLACE"
+# ─────────────────────────────────────────────────────────────────

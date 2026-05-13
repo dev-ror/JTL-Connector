@@ -1,0 +1,6 @@
+# Python dependencies
+pyodbc==5.1.0
+SQLAlchemy==2.0.30
+python-dotenv==1.0.1
+requests==2.31.0        # optional: for REST-based Odoo access
+tqdm==4.66.4            # optional: progress bars
