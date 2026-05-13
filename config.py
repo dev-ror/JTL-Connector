@@ -3,8 +3,14 @@ Configuration for JTL-Wawi → Odoo Migration Connector
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 
 @dataclass
@@ -13,7 +19,7 @@ class SQLServerConfig:
     port: int = int(os.getenv("SQLSERVER_PORT", "1433"))
     database: str = os.getenv("SQLSERVER_DB", "eazybusiness")
     username: str = os.getenv("SQLSERVER_USER", "sa")
-    password: str = os.getenv("SQLSERVER_PASSWORD", "YourPassword123!")
+    password: str = os.getenv("SQLSERVER_PASSWORD", "")
     driver: str = "ODBC Driver 17 for SQL Server"
     trust_server_certificate: bool = True
 
@@ -33,12 +39,14 @@ class OdooConfig:
     port: int = int(os.getenv("ODOO_PORT", "8069"))
     database: str = os.getenv("ODOO_DB", "odoo")
     username: str = os.getenv("ODOO_USER", "admin")
-    password: str = os.getenv("ODOO_PASSWORD", "admin")
-    api_key: Optional[str] = os.getenv("ODOO_API_KEY", None)  # Preferred over password
+    password: str = os.getenv("ODOO_PASSWORD", "")
+    api_key: Optional[str] = os.getenv("ODOO_API_KEY", None)
 
     @property
     def url(self) -> str:
-        return f"{self.host}:{self.port}" if self.port not in (80, 443, 8069) else self.host
+        host = self.host.rstrip("/")
+        default_port = 443 if host.startswith("https://") else 80
+        return host if self.port == default_port else f"{host}:{self.port}"
 
 
 @dataclass
@@ -57,7 +65,7 @@ class MigrationConfig:
     dry_run: bool = False          # If True: read JTL but don't write to Odoo
     log_level: str = "INFO"
     log_file: str = "migration.log"
-    output_dir: str = "./output"   # CSV / JSON exports land here
+    output_dir: str = "./output"
 
     # Odoo defaults
     default_lang: str = "de_DE"

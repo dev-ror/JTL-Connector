@@ -4,10 +4,10 @@ Queries the JTL eazybusiness database and returns normalised Python dicts.
 """
 
 import logging
-from typing import Any, Dict, Generator, List, Optional
 from contextlib import contextmanager
+from typing import Any, Dict, List, Optional
 
-import pyodbc
+import pyodbc  # noqa: F401 – required by pyodbc ODBC driver registration
 import sqlalchemy
 from sqlalchemy import create_engine, text
 
@@ -33,7 +33,6 @@ class JTLReader:
             pool_size=5,
             echo=False,
         )
-        # smoke-test
         with self._engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         logger.info("✅  Connected to JTL SQL Server: %s / %s", self.cfg.host, self.cfg.database)
@@ -53,23 +52,61 @@ class JTLReader:
             keys = result.keys()
             return [dict(zip(keys, row)) for row in result.fetchall()]
 
-    def _fetch_batched(
-        self, sql: str, params: dict = None
-    ) -> Generator[List[Dict[str, Any]], None, None]:
-        """Yield rows in batches of self.mig.batch_size."""
-        rows = self._fetchall(sql, params)
-        for i in range(0, len(rows), self.mig.batch_size):
-            yield rows[i : i + self.mig.batch_size]
+    # ------------------------------------------------------------------ #
+    #  Connection-test helpers                                             #
+    # ------------------------------------------------------------------ #
+
+    def get_summary_stats(self) -> Dict[str, int]:
+        """Return record counts for all entity types."""
+        queries = [
+            ("categories",     "SELECT COUNT(*) AS cnt FROM dbo.tkategorie"),
+            ("manufacturers",  "SELECT COUNT(*) AS cnt FROM dbo.tHersteller"),
+            ("products",       "SELECT COUNT(*) AS cnt FROM dbo.tArtikel WHERE nAktiv = 1"),
+            ("attributes",     "SELECT COUNT(*) AS cnt FROM dbo.tEigenschaft"),
+            ("price_groups",   "SELECT COUNT(*) AS cnt FROM dbo.tPreisgruppe"),
+            ("customers",      "SELECT COUNT(*) AS cnt FROM dbo.tKunde"),
+            ("orders",         "SELECT COUNT(*) AS cnt FROM dbo.tBestellung WHERE nStorniert = 0"),
+            ("order_lines",    "SELECT COUNT(*) AS cnt FROM dbo.tBestellungPos"),
+            ("product_images", "SELECT COUNT(*) AS cnt FROM dbo.tArtikelBild"),
+        ]
+        stats: Dict[str, int] = {}
+        for label, sql in queries:
+            try:
+                rows = self._fetchall(sql)
+                stats[label] = rows[0]["cnt"] if rows else 0
+            except Exception as exc:
+                logger.warning("  Count query failed for %s: %s", label, exc)
+                stats[label] = -1
+        return stats
+
+    def get_samples(self, limit: int = 5) -> Dict[str, List[Dict[str, Any]]]:
+        """Return small sample rows from key tables for connection testing."""
+        n = int(limit)
+        return {
+            "categories": self._fetchall(
+                f"SELECT TOP {n} kKategorie AS jtl_id, COALESCE(cName,'') AS name"
+                " FROM dbo.tkategorie ORDER BY kKategorie"
+            ),
+            "products": self._fetchall(
+                f"SELECT TOP {n} kArtikel AS jtl_id, cArtNr AS default_code, cName AS name"
+                " FROM dbo.tArtikel WHERE nAktiv = 1 ORDER BY kArtikel"
+            ),
+            "customers": self._fetchall(
+                f"SELECT TOP {n} kKunde AS jtl_id, cKundenNr AS ref, cNachname AS lastname"
+                " FROM dbo.tKunde ORDER BY kKunde"
+            ),
+            "orders": self._fetchall(
+                f"SELECT TOP {n} kBestellung AS jtl_id, cBestellNr AS name"
+                " FROM dbo.tBestellung WHERE nStorniert = 0 ORDER BY dErstellt DESC"
+            ),
+        }
 
     # ------------------------------------------------------------------ #
     #  Categories                                                           #
     # ------------------------------------------------------------------ #
 
     def get_categories(self) -> List[Dict[str, Any]]:
-        """
-        Returns flat list; parent_id=None means root.
-        JTL stores categories in dbo.tkategorie + dbo.tkategoriesprache (multilingual).
-        """
+        """Returns flat list; parent_id=None means root."""
         sql = """
             SELECT
                 k.kKategorie          AS jtl_id,
@@ -93,10 +130,9 @@ class JTLReader:
     # ------------------------------------------------------------------ #
 
     def get_products(self) -> List[Dict[str, Any]]:
-        """
-        Returns master products (Vaterartikel or simple Artikel).
-        Variants are fetched separately.
-        """
+        """Returns active products. Inactive products are excluded but may
+        still be referenced by historical orders — those order lines will be
+        skipped during import."""
         sql = """
             SELECT
                 a.kArtikel              AS jtl_id,
@@ -137,7 +173,6 @@ class JTLReader:
     # ------------------------------------------------------------------ #
 
     def get_product_attributes(self) -> List[Dict[str, Any]]:
-        """Attribute definitions (Farbe, Größe, …)."""
         sql = """
             SELECT
                 e.kEigenschaft      AS jtl_id,
@@ -153,7 +188,6 @@ class JTLReader:
         return self._fetchall(sql)
 
     def get_attribute_values(self) -> List[Dict[str, Any]]:
-        """All possible attribute values (Rot, Blau, XL, …)."""
         sql = """
             SELECT
                 ew.kEigenschaftWert     AS jtl_id,
@@ -168,7 +202,6 @@ class JTLReader:
         return self._fetchall(sql)
 
     def get_variant_combinations(self) -> List[Dict[str, Any]]:
-        """Maps child Artikel → attribute value combinations."""
         sql = """
             SELECT
                 ekw.kArtikel            AS jtl_variant_id,
@@ -193,10 +226,6 @@ class JTLReader:
         return self._fetchall(sql)
 
     def get_customer_prices(self) -> List[Dict[str, Any]]:
-        """
-        Returns all customer-specific and price-group-specific prices.
-        Covers both tPreis (Kundenpreise) and tKundengruppe overrides.
-        """
         sql = """
             SELECT
                 p.kPreis            AS jtl_id,
@@ -236,7 +265,6 @@ class JTLReader:
                 k.kKundengruppe         AS jtl_customergroup_id,
                 k.nAktiv                AS active,
                 k.dErstellt             AS create_date,
-                -- billing address from tKundenadresse (type 1)
                 ka.cStrasse             AS street,
                 ka.cHausnummer          AS street2,
                 ka.cPLZ                 AS zip,
@@ -280,7 +308,6 @@ class JTLReader:
                 b.cKommentar            AS note,
                 b.cVersandartName       AS carrier_name,
                 b.cZahlungsartName      AS payment_method,
-                -- shipping address
                 lk.cFirma               AS ship_company,
                 lk.cVorname             AS ship_firstname,
                 lk.cNachname            AS ship_lastname,
@@ -289,7 +316,6 @@ class JTLReader:
                 lk.cPLZ                 AS ship_zip,
                 lk.cOrt                 AS ship_city,
                 lk.cLand                AS ship_country_code,
-                -- billing address
                 rk.cFirma               AS bill_company,
                 rk.cVorname             AS bill_firstname,
                 rk.cNachname            AS bill_lastname,
@@ -308,14 +334,11 @@ class JTLReader:
         logger.info("  Orders found: %d", len(rows))
         return rows
 
-    def get_order_lines(self, order_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
-        id_filter = ""
-        params: dict = {}
-        if order_ids:
-            placeholders = ",".join([f":id{i}" for i in range(len(order_ids))])
-            id_filter = f"WHERE bp.kBestellung IN ({placeholders})"
-            params = {f"id{i}": v for i, v in enumerate(order_ids)}
-
+    def get_order_lines(self, order_ids: List[int]) -> List[Dict[str, Any]]:
+        if not order_ids:
+            return []
+        placeholders = ",".join([f":id{i}" for i in range(len(order_ids))])
+        params = {f"id{i}": v for i, v in enumerate(order_ids)}
         sql = f"""
             SELECT
                 bp.kBestellPos          AS jtl_id,
@@ -330,7 +353,7 @@ class JTLReader:
                 bp.cEAN                 AS barcode,
                 bp.nPosTyp              AS line_type    -- 1=Artikel, 2=Versand, 3=Gutschein
             FROM dbo.tBestellungPos bp
-            {id_filter}
+            WHERE bp.kBestellung IN ({placeholders})
             ORDER BY bp.kBestellung, bp.kBestellPos
         """
         return self._fetchall(sql, params)

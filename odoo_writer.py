@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import xmlrpc.client
@@ -15,6 +16,14 @@ import xmlrpc.client
 from config import OdooConfig, MigrationConfig
 
 logger = logging.getLogger(__name__)
+
+# JTL cStatus → Odoo sale.order state
+_JTL_STATE_MAP: Dict[str, str] = {
+    "N": "sale",   # Neu / In Bearbeitung
+    "B": "sale",   # Bezahlt
+    "V": "done",   # Versandt
+    "A": "done",   # Abgeschlossen
+}
 
 
 # ─────────────────────────────────────────────────────────────────── #
@@ -24,25 +33,39 @@ logger = logging.getLogger(__name__)
 class IDMapping:
     """Persist bidirectional mappings so restarts are safe."""
 
-    def __init__(self, path: str):
+    _SAVE_EVERY = 50  # flush to disk every N writes
+
+    def __init__(self, path: str, dry_run: bool = False):
         self._path = Path(path)
         self._data: Dict[str, Dict[str, int]] = {}
-        self._load()
+        self._dry_run = dry_run
+        self._dirty = 0
+        if not dry_run:
+            self._load()
+        logger.debug("ID mappings loaded from %s", self._path)
 
     def _load(self):
         if self._path.exists():
             with self._path.open() as f:
                 self._data = json.load(f)
-        logger.debug("ID mappings loaded from %s", self._path)
 
     def save(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("w") as f:
             json.dump(self._data, f, indent=2)
+        self._dirty = 0
+
+    def flush(self):
+        """Write any pending changes to disk."""
+        if not self._dry_run and self._dirty > 0:
+            self.save()
 
     def set(self, entity: str, jtl_id: int, odoo_id: int):
         self._data.setdefault(entity, {})[str(jtl_id)] = odoo_id
-        self.save()
+        if not self._dry_run:
+            self._dirty += 1
+            if self._dirty >= self._SAVE_EVERY:
+                self.save()
 
     def get(self, entity: str, jtl_id: int) -> Optional[int]:
         return self._data.get(entity, {}).get(str(jtl_id))
@@ -59,10 +82,11 @@ class OdooWriter:
     def __init__(self, odoo_cfg: OdooConfig, mig_cfg: MigrationConfig):
         self.cfg = odoo_cfg
         self.mig = mig_cfg
-        self.mapping = IDMapping(mig_cfg.mapping_file)
+        self.mapping = IDMapping(mig_cfg.mapping_file, dry_run=mig_cfg.dry_run)
         self._uid: Optional[int] = None
         self._models = None
         self._common = None
+        self._dry_run_counter = 0  # fake IDs for dry-run creates, count downward
 
     # ---------------------------------------------------------------- #
     #  Auth                                                              #
@@ -84,7 +108,10 @@ class OdooWriter:
     def _exec(self, model: str, method: str, *args, **kwargs) -> Any:
         if self.mig.dry_run and method in ("create", "write", "unlink"):
             logger.debug("[DRY-RUN] %s.%s(%s)", model, method, args)
-            return 0
+            if method == "create":
+                self._dry_run_counter -= 1
+                return self._dry_run_counter
+            return True
         return self._models.execute_kw(
             self.cfg.database, self._uid,
             self.cfg.api_key or self.cfg.password,
@@ -135,8 +162,6 @@ class OdooWriter:
 
     def import_categories(self, categories: List[Dict]) -> int:
         logger.info("→ Importing %d categories…", len(categories))
-        # Sort: parents before children
-        by_id = {c["jtl_id"]: c for c in categories}
         ordered = self._topological_sort(categories, "jtl_id", "jtl_parent_id")
         count = 0
         for cat in ordered:
@@ -186,9 +211,6 @@ class OdooWriter:
         logger.info("→ Importing %d products…", len(products))
         count = 0
         for p in products:
-            cat_id = None
-            # (category mapping should have been done at product level in JTL
-            #  via tArtikelKategorie – pass if you enrich the JTL reader)
             vals = {
                 "name": p["name"] or p["default_code"] or "Unknown",
                 "default_code": p.get("default_code"),
@@ -206,13 +228,15 @@ class OdooWriter:
             if p.get("jtl_manufacturer_id"):
                 mfr_id = self.mapping.get("manufacturer", p["jtl_manufacturer_id"])
                 if mfr_id:
-                    # Odoo 16+: product.template has no direct manufacturer field by default
-                    # If you have OCA product_brand module:
+                    # If OCA product_brand module is installed:
                     # vals["product_brand_id"] = mfr_id
                     pass
 
-            # Search by internal reference first (idempotent)
-            domain = [("default_code", "=", vals["default_code"])] if vals["default_code"] else [("name", "=", vals["name"])]
+            domain = (
+                [("default_code", "=", vals["default_code"])]
+                if vals["default_code"]
+                else [("name", "=", vals["name"])]
+            )
             odoo_id, created = self._find_or_create("product.template", domain, vals)
             self.mapping.set("product", p["jtl_id"], odoo_id)
             if created:
@@ -228,7 +252,6 @@ class OdooWriter:
     def import_attributes(self, attributes: List[Dict], values: List[Dict]) -> int:
         """Create product.attribute + product.attribute.value records."""
         logger.info("→ Importing %d attributes / %d values…", len(attributes), len(values))
-        # Attributes
         for a in attributes:
             odoo_id, _ = self._find_or_create(
                 "product.attribute",
@@ -237,7 +260,6 @@ class OdooWriter:
             )
             self.mapping.set("attribute", a["jtl_id"], odoo_id)
 
-        # Attribute values
         for v in values:
             attr_odoo_id = self.mapping.get("attribute", v["jtl_attribute_id"])
             if not attr_odoo_id:
@@ -251,14 +273,8 @@ class OdooWriter:
         return len(values)
 
     def attach_variants(self, combinations: List[Dict]) -> int:
-        """
-        Attach product.template.attribute.line records to parent templates.
-        JTL child articles → Odoo product.product variants.
-        """
+        """Attach product.template.attribute.line records to parent templates."""
         logger.info("→ Attaching variant combinations…")
-        # Group by parent product (via jtl_variant_id → kVaterArtikel)
-        # For each unique (template, attribute) pair, ensure attribute line exists
-        from collections import defaultdict
         tmpl_attr: Dict[Tuple, set] = defaultdict(set)
 
         for combo in combinations:
@@ -293,7 +309,6 @@ class OdooWriter:
 
     def import_pricelists(self, price_groups: List[Dict], customer_prices: List[Dict]) -> int:
         logger.info("→ Importing pricelists…")
-        # Create a pricelist per JTL price group
         for pg in price_groups:
             pl_id, _ = self._find_or_create(
                 "product.pricelist",
@@ -302,7 +317,6 @@ class OdooWriter:
             )
             self.mapping.set("pricelist", pg["jtl_id"], pl_id)
 
-        # Create pricelist items
         count = 0
         for cp in customer_prices:
             pl_id = self.mapping.get("pricelist", cp.get("jtl_pricegroup_id") or 0)
@@ -383,15 +397,12 @@ class OdooWriter:
 
     def import_orders(self, orders: List[Dict], order_lines: List[Dict]) -> int:
         logger.info("→ Importing %d orders…", len(orders))
-        # Index lines by order id
-        from collections import defaultdict
         lines_by_order: Dict[int, List[Dict]] = defaultdict(list)
         for line in order_lines:
             lines_by_order[line["jtl_order_id"]].append(line)
 
         count = 0
         for order in orders:
-            # Skip if already imported
             if self.mapping.get("order", order["jtl_id"]):
                 continue
 
@@ -400,12 +411,14 @@ class OdooWriter:
                 logger.warning("  ⚠ Order %s: customer not found, skipping.", order["name"])
                 continue
 
+            odoo_state = _JTL_STATE_MAP.get(str(order.get("state", "")).upper(), "sale")
+
             order_vals = {
                 "name": order["name"],
                 "partner_id": partner_id,
                 "date_order": str(order.get("date_order", "")),
                 "note": order.get("note", ""),
-                "state": "sale",      # confirmed
+                "state": odoo_state,
                 "order_line": [],
             }
 
@@ -487,28 +500,6 @@ class OdooWriter:
 
     @staticmethod
     def _topological_sort(items, id_key, parent_key):
-        from collections import deque
-        by_id = {item[id_key]: item for item in items}
-        visited = set()
-        result = []
-
-        def visit(item):
-            if item[id_key] in visited:
-                return
-            visited.add(item[id_key])
-            parent = item.get(parent_key)
-            if parent and parent in by_id:
-                visit(by_id[parent])
-            result.append(item)
-
-        for item in items:
-            visit(item)
-        return result
-
-    _topological_sort = staticmethod(lambda items, id_key, parent_key: OdooWriter._topological_sort.__func__(None, items, id_key, parent_key))
-
-    @staticmethod
-    def _topo(items, id_key, parent_key):
         by_id = {item[id_key]: item for item in items}
         visited = set()
         result = []

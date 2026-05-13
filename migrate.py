@@ -1,6 +1,7 @@
 """
 JTL → Odoo Migration Orchestrator
 Run:  python migrate.py [--dry-run] [--module categories,products,customers,orders]
+      python migrate.py --test           # test JTL + Odoo connectivity only
 """
 
 import argparse
@@ -35,6 +36,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="JTL-Wawi → Odoo Migration")
     p.add_argument("--dry-run", action="store_true", help="Read JTL, do NOT write to Odoo")
     p.add_argument(
+        "--test", action="store_true",
+        help="Test JTL SQL Server (and Odoo) connectivity and print record counts, then exit",
+    )
+    p.add_argument(
         "--module",
         default="all",
         help=(
@@ -52,6 +57,66 @@ def parse_args():
     )
     return p.parse_args()
 
+
+# ── Connection-test screen ─────────────────────────────────────────── #
+
+def test_connection(_args):
+    """Test JTL SQL Server and Odoo connectivity; print record counts."""
+    setup_logging(migration_config)
+
+    SEP = "=" * 62
+    print(SEP)
+    print(f"JTL Connection Test  |  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(SEP)
+
+    start = time.time()
+
+    # ── SQL Server ──────────────────────────────────────────────────── #
+    print(
+        f"\nConnecting to SQL Server:"
+        f"  {sql_config.host}:{sql_config.port} / {sql_config.database} …"
+    )
+    reader = JTLReader(sql_config, migration_config)
+    try:
+        reader.connect()
+    except Exception as exc:
+        print(f"\n✗  Connection FAILED: {exc}")
+        sys.exit(1)
+
+    print("Fetching record counts …\n")
+    stats = reader.get_summary_stats()
+    samples = reader.get_samples(limit=3)
+
+    print(f"  {'Entity':<20s}  {'Count':>7s}  Sample")
+    print("  " + "─" * 56)
+    for entity, count in stats.items():
+        count_str = f"{count:>7,d}" if count >= 0 else "  ERROR"
+        sample_rows = samples.get(entity, [])
+        if sample_rows:
+            ids = [str(r.get("jtl_id", r.get("name", "?"))) for r in sample_rows]
+            sample_str = "IDs: " + ", ".join(ids)
+        else:
+            sample_str = ""
+        print(f"  {entity:<20s}  {count_str}  {sample_str}")
+
+    reader.disconnect()
+
+    # ── Odoo ────────────────────────────────────────────────────────── #
+    print(f"\nConnecting to Odoo:  {odoo_config.url} / {odoo_config.database} …")
+    writer = OdooWriter(odoo_config, migration_config)
+    try:
+        writer.connect()
+        print("✅  Odoo authentication successful")
+    except Exception as exc:
+        print(f"⚠   Odoo connection failed: {exc}")
+
+    elapsed = time.time() - start
+    print(f"\n{SEP}")
+    print(f"Test completed in {elapsed:.1f} s")
+    print(SEP)
+
+
+# ── Full migration ─────────────────────────────────────────────────── #
 
 def run(args):
     cfg = migration_config
@@ -81,7 +146,6 @@ def run(args):
     log.info("JTL → Odoo Migration  |  %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
     log.info("=" * 60)
 
-    # ── Connect ──────────────────────────────────────────────────── #
     reader = JTLReader(sql_config, cfg)
     writer = OdooWriter(odoo_config, cfg)
 
@@ -91,22 +155,18 @@ def run(args):
     stats = {}
 
     try:
-        # 1. CATEGORIES
         if "categories" in modules:
             cats = reader.get_categories()
             stats["categories"] = writer.import_categories(cats)
 
-        # 2. MANUFACTURERS
         if "manufacturers" in modules:
             mfrs = reader.get_manufacturers()
             stats["manufacturers"] = writer.import_manufacturers(mfrs)
 
-        # 3. PRODUCTS (templates)
         if "products" in modules:
             prods = reader.get_products()
             stats["products"] = writer.import_products(prods)
 
-        # 4. VARIANTS
         if "variants" in modules:
             attrs = reader.get_product_attributes()
             values = reader.get_attribute_values()
@@ -114,31 +174,28 @@ def run(args):
             writer.import_attributes(attrs, values)
             stats["variants"] = writer.attach_variants(combos)
 
-        # 5. PRICING
         if "pricing" in modules:
             price_groups = reader.get_price_groups()
             prices = reader.get_customer_prices()
             stats["pricing"] = writer.import_pricelists(price_groups, prices)
 
-        # 6. CUSTOMERS
         if "customers" in modules:
             customers = reader.get_customers()
             stats["customers"] = writer.import_customers(customers)
 
-        # 7. ORDERS
         if "orders" in modules:
             orders = reader.get_orders()
             order_ids = [o["jtl_id"] for o in orders]
-            lines = reader.get_order_lines(order_ids) if order_ids else []
+            lines = reader.get_order_lines(order_ids)
             stats["orders"] = writer.import_orders(orders, lines)
 
-        # 8. IMAGES
         if "images" in modules:
             images = reader.get_product_images()
             stats["images"] = writer.import_images(images, args.image_dir)
 
     finally:
         reader.disconnect()
+        writer.mapping.flush()
 
     elapsed = time.time() - start
     log.info("=" * 60)
@@ -151,4 +208,7 @@ def run(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    run(args)
+    if args.test:
+        test_connection(args)
+    else:
+        run(args)
