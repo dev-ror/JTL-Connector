@@ -423,8 +423,8 @@ class OdooWriter:
             }
 
             for line in lines_by_order.get(order["jtl_id"], []):
-                if line.get("line_type") != 1:
-                    continue  # skip shipping / coupon lines
+                if line.get("line_type") not in (1, None):
+                    continue  # skip text lines (nType=0); keep product lines (nType=1)
                 prod_id = self._get_product_product_id(line.get("jtl_product_id"))
                 if not prod_id:
                     logger.debug("    product not found for line %s", line.get("default_code"))
@@ -466,20 +466,34 @@ class OdooWriter:
     #  8. Product Images                                                #
     # ---------------------------------------------------------------- #
 
-    def import_images(self, images: List[Dict], image_base_dir: str = "") -> int:
+    def import_images(self, images: List[Dict], image_base_dir: str = "", reader=None) -> int:
+        """Import product images. Supports two modes:
+        - reader != None: binary data fetched from JTL DB via reader.get_image_data()
+        - reader is None: binary data read from local file paths (image_base_dir + image_path)
+        """
         logger.info("→ Importing product images…")
         count = 0
         for img in images:
             tmpl_id = self.mapping.get("product", img["jtl_product_id"])
             if not tmpl_id:
                 continue
-            path = img.get("image_path_large") or img.get("image_path", "")
-            full_path = os.path.join(image_base_dir, path) if image_base_dir else path
-            if not os.path.isfile(full_path):
-                logger.debug("  Image not found: %s", full_path)
-                continue
-            with open(full_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
+
+            # Load binary image data
+            b64 = None
+            if reader is not None and img.get("kBild"):
+                b64 = reader.get_image_data(img["kBild"])
+                if not b64:
+                    logger.debug("  Image not found in DB: kBild=%s", img.get("kBild"))
+                    continue
+            else:
+                path = img.get("image_path_large") or img.get("image_path", "")
+                full_path = os.path.join(image_base_dir, path) if image_base_dir else path
+                if not os.path.isfile(full_path):
+                    logger.debug("  Image file not found: %s", full_path)
+                    continue
+                with open(full_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+
             try:
                 if img["sort_order"] == 0:
                     self._exec("product.template", "write", [tmpl_id], {"image_1920": b64})
@@ -490,7 +504,7 @@ class OdooWriter:
                     )
                 count += 1
             except Exception as exc:
-                logger.error("  ✗ Image %s: %s", full_path, exc)
+                logger.error("  ✗ Image kBild=%s: %s", img.get("kBild", "?"), exc)
         logger.info("  ✅ Images uploaded: %d", count)
         return count
 

@@ -1,19 +1,33 @@
 """
 JTL-Wawi SQL Server Reader
 Queries the JTL eazybusiness database and returns normalised Python dicts.
+
+Schema notes (this backup is a newer JTL version):
+  - Orders live in schema Verkauf (Verkauf.tAuftrag, Verkauf.tAuftragPosition)
+  - Product names/descs are in dbo.tArtikelBeschreibung (kSprache=1, kShop=0, kPlattform=1)
+  - Category names are in dbo.tKategorieSprache (same language keys)
+  - tArtikel uses cAktiv='Y' instead of nAktiv=1
+  - Customer address details live in dbo.tAdresse, not directly on dbo.tkunde
+  - Images are stored as binary blobs in dbo.tBild, linked via dbo.tArtikelbildPlattform
+  - Variant combinations use dbo.tEigenschaftKombiWert (not tEigenschaftKombinationWert)
 """
 
+import base64
 import logging
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
-import pyodbc  # noqa: F401 – required by pyodbc ODBC driver registration
+import pyodbc  # noqa: F401
 import sqlalchemy
 from sqlalchemy import create_engine, text
 
 from config import SQLServerConfig, MigrationConfig
 
 logger = logging.getLogger(__name__)
+
+_LANG = 1    # kSprache = 1 (Deutsch)
+_SHOP = 0    # kShop = 0 (base/default)
+_PLAT = 1    # kPlattform = 1 (JTL-Wawi default platform)
 
 
 class JTLReader:
@@ -61,13 +75,12 @@ class JTLReader:
         queries = [
             ("categories",     "SELECT COUNT(*) AS cnt FROM dbo.tkategorie"),
             ("manufacturers",  "SELECT COUNT(*) AS cnt FROM dbo.tHersteller"),
-            ("products",       "SELECT COUNT(*) AS cnt FROM dbo.tArtikel WHERE nAktiv = 1"),
-            ("attributes",     "SELECT COUNT(*) AS cnt FROM dbo.tEigenschaft"),
-            ("price_groups",   "SELECT COUNT(*) AS cnt FROM dbo.tPreisgruppe"),
-            ("customers",      "SELECT COUNT(*) AS cnt FROM dbo.tKunde"),
-            ("orders",         "SELECT COUNT(*) AS cnt FROM dbo.tBestellung WHERE nStorniert = 0"),
-            ("order_lines",    "SELECT COUNT(*) AS cnt FROM dbo.tBestellungPos"),
-            ("product_images", "SELECT COUNT(*) AS cnt FROM dbo.tArtikelBild"),
+            ("products",       "SELECT COUNT(*) AS cnt FROM dbo.tArtikel WHERE cAktiv='Y'"),
+            ("attributes",     "SELECT COUNT(*) AS cnt FROM dbo.teigenschaft"),
+            ("customers",      "SELECT COUNT(*) AS cnt FROM dbo.tkunde WHERE cSperre='N' OR cSperre IS NULL"),
+            ("orders",         "SELECT COUNT(*) AS cnt FROM Verkauf.tAuftrag WHERE nStorno=0"),
+            ("order_lines",    "SELECT COUNT(*) AS cnt FROM Verkauf.tAuftragPosition"),
+            ("product_images", "SELECT COUNT(*) AS cnt FROM dbo.tArtikelbildPlattform WHERE kShop=0 AND kPlattform=0"),
         ]
         stats: Dict[str, int] = {}
         for label, sql in queries:
@@ -82,43 +95,67 @@ class JTLReader:
     def get_samples(self, limit: int = 5) -> Dict[str, List[Dict[str, Any]]]:
         """Return small sample rows from key tables for connection testing."""
         n = int(limit)
-        return {
-            "categories": self._fetchall(
-                f"SELECT TOP {n} kKategorie AS jtl_id, COALESCE(cName,'') AS name"
-                " FROM dbo.tkategorie ORDER BY kKategorie"
-            ),
-            "products": self._fetchall(
-                f"SELECT TOP {n} kArtikel AS jtl_id, cArtNr AS default_code, cName AS name"
-                " FROM dbo.tArtikel WHERE nAktiv = 1 ORDER BY kArtikel"
-            ),
-            "customers": self._fetchall(
-                f"SELECT TOP {n} kKunde AS jtl_id, cKundenNr AS ref, cNachname AS lastname"
-                " FROM dbo.tKunde ORDER BY kKunde"
-            ),
-            "orders": self._fetchall(
-                f"SELECT TOP {n} kBestellung AS jtl_id, cBestellNr AS name"
-                " FROM dbo.tBestellung WHERE nStorniert = 0 ORDER BY dErstellt DESC"
-            ),
+        samples: Dict[str, List[Dict[str, Any]]] = {}
+        queries = {
+            "categories": f"""
+                SELECT TOP {n} k.kKategorie AS jtl_id, COALESCE(ks.cName,'') AS name
+                FROM dbo.tkategorie k
+                LEFT JOIN dbo.tKategorieSprache ks
+                    ON ks.kKategorie = k.kKategorie AND ks.kSprache={_LANG}
+                ORDER BY k.kKategorie
+            """,
+            "products": f"""
+                SELECT TOP {n} a.kArtikel AS jtl_id, a.cArtNr AS default_code,
+                       COALESCE(ab.cName, a.cArtNr, '') AS name
+                FROM dbo.tArtikel a
+                LEFT JOIN dbo.tArtikelBeschreibung ab
+                    ON ab.kArtikel = a.kArtikel AND ab.kSprache={_LANG}
+                       AND ab.kShop={_SHOP} AND ab.kPlattform={_PLAT}
+                WHERE a.cAktiv = 'Y'
+                ORDER BY a.kArtikel
+            """,
+            "customers": f"""
+                SELECT TOP {n} k.kKunde AS jtl_id, k.cKundenNr AS ref,
+                       COALESCE(a.cName,'') AS lastname
+                FROM dbo.tkunde k
+                LEFT JOIN dbo.tAdresse a ON a.kKunde = k.kKunde AND a.nTyp = 1
+                ORDER BY k.kKunde
+            """,
+            "orders": f"""
+                SELECT TOP {n} kAuftrag AS jtl_id, cAuftragsNr AS name
+                FROM Verkauf.tAuftrag
+                WHERE nStorno = 0
+                ORDER BY dErstellt DESC
+            """,
         }
+        for label, sql in queries.items():
+            try:
+                samples[label] = self._fetchall(sql)
+            except Exception as exc:
+                logger.warning("  Sample query failed for %s: %s", label, exc)
+                samples[label] = []
+        return samples
 
     # ------------------------------------------------------------------ #
     #  Categories                                                           #
     # ------------------------------------------------------------------ #
 
     def get_categories(self) -> List[Dict[str, Any]]:
-        """Returns flat list; parent_id=None means root."""
-        sql = """
+        """Returns flat list; jtl_parent_id=None means root."""
+        sql = f"""
             SELECT
-                k.kKategorie          AS jtl_id,
-                k.kOberKategorie      AS jtl_parent_id,
-                k.nSort               AS sort_order,
-                COALESCE(ks.cName, k.cName)        AS name,
+                k.kKategorie                        AS jtl_id,
+                NULLIF(k.kOberKategorie, 0)         AS jtl_parent_id,
+                k.nSort                             AS sort_order,
+                COALESCE(ks.cName, '')              AS name,
                 COALESCE(ks.cBeschreibung, '')      AS description,
-                COALESCE(ks.cMetaTitle, '')         AS meta_title,
+                COALESCE(ks.cTitleTag, '')          AS meta_title,
                 COALESCE(ks.cMetaDescription, '')   AS meta_description
             FROM dbo.tkategorie k
-            LEFT JOIN dbo.tkategoriesprache ks
-                ON ks.kKategorie = k.kKategorie AND ks.cISOSprache = 'ger'
+            LEFT JOIN dbo.tKategorieSprache ks
+                ON ks.kKategorie = k.kKategorie
+                AND ks.kSprache = {_LANG}
+            WHERE k.cAktiv = 'Y'
             ORDER BY k.kOberKategorie, k.nSort
         """
         rows = self._fetchall(sql)
@@ -131,37 +168,38 @@ class JTLReader:
 
     def get_products(self) -> List[Dict[str, Any]]:
         """Returns active products. Inactive products are excluded but may
-        still be referenced by historical orders — those order lines will be
-        skipped during import."""
-        sql = """
+        still be referenced by historical orders — those lines are skipped."""
+        sql = f"""
             SELECT
-                a.kArtikel              AS jtl_id,
-                a.kVaterArtikel         AS jtl_parent_id,
-                a.cArtNr                AS default_code,
-                a.cEAN                  AS barcode,
-                COALESCE(as2.cName, a.cName)        AS name,
-                COALESCE(as2.cBeschreibung, '')      AS description_sale,
-                COALESCE(as2.cKurzBeschreibung, '') AS description,
-                a.fVKNetto              AS list_price,
-                a.fEKNetto              AS standard_price,
-                a.fGewicht              AS weight,
-                a.fBreite               AS product_width,
-                a.fHoehe                AS product_height,
-                a.fLaenge               AS product_length,
-                a.nAktiv                AS active,
-                a.cHAN                  AS manufacturer_ref,
-                a.kHersteller           AS jtl_manufacturer_id,
-                a.kSteuerklasse         AS jtl_tax_id,
-                a.cLagerBeachten        AS track_inventory,
-                a.fLagerbestand         AS qty_on_hand,
-                a.cLieferstatus         AS delivery_status,
-                a.fUVP                  AS msrp,
-                a.dErstellt             AS create_date,
-                a.dLetzteAktualisierung AS write_date
+                a.kArtikel                              AS jtl_id,
+                NULLIF(a.kVaterArtikel, 0)              AS jtl_parent_id,
+                a.cArtNr                                AS default_code,
+                a.cBarcode                              AS barcode,
+                COALESCE(ab.cName, a.cArtNr, '')        AS name,
+                COALESCE(ab.cBeschreibung, '')           AS description_sale,
+                COALESCE(ab.cKurzBeschreibung, '')       AS description,
+                a.fVKNetto                              AS list_price,
+                a.fEKNetto                              AS standard_price,
+                a.fGewicht                              AS weight,
+                a.fBreite                               AS product_width,
+                a.fHoehe                                AS product_height,
+                a.fLaenge                               AS product_length,
+                CASE WHEN a.cAktiv='Y' THEN 1 ELSE 0 END AS active,
+                a.cHAN                                  AS manufacturer_ref,
+                a.kHersteller                           AS jtl_manufacturer_id,
+                a.kSteuerklasse                         AS jtl_tax_id,
+                a.cLagerAktiv                           AS track_inventory,
+                a.nLagerbestand                         AS qty_on_hand,
+                a.fUVP                                  AS msrp,
+                a.dErstelldatum                         AS create_date,
+                a.dMod                                  AS write_date
             FROM dbo.tArtikel a
-            LEFT JOIN dbo.tArtikelsprache as2
-                ON as2.kArtikel = a.kArtikel AND as2.cISOSprache = 'ger'
-            WHERE a.nAktiv = 1
+            LEFT JOIN dbo.tArtikelBeschreibung ab
+                ON ab.kArtikel = a.kArtikel
+                AND ab.kSprache = {_LANG}
+                AND ab.kShop = {_SHOP}
+                AND ab.kPlattform = {_PLAT}
+            WHERE a.cAktiv = 'Y'
             ORDER BY a.kArtikel
         """
         rows = self._fetchall(sql)
@@ -173,43 +211,48 @@ class JTLReader:
     # ------------------------------------------------------------------ #
 
     def get_product_attributes(self) -> List[Dict[str, Any]]:
-        sql = """
+        sql = f"""
             SELECT
-                e.kEigenschaft      AS jtl_id,
-                e.kArtikel          AS jtl_product_id,
-                COALESCE(es.cName, e.cName) AS name,
-                e.cTyp              AS attr_type,
-                e.nSort             AS sort_order
-            FROM dbo.tEigenschaft e
-            LEFT JOIN dbo.tEigenschaftsprache es
-                ON es.kEigenschaft = e.kEigenschaft AND es.cISOSprache = 'ger'
+                e.kEigenschaft              AS jtl_id,
+                e.kArtikel                  AS jtl_product_id,
+                COALESCE(es.cName, '')      AS name,
+                e.cTyp                      AS attr_type,
+                e.nSort                     AS sort_order
+            FROM dbo.teigenschaft e
+            LEFT JOIN dbo.tEigenschaftSprache es
+                ON es.kEigenschaft = e.kEigenschaft AND es.kSprache = {_LANG}
             ORDER BY e.kArtikel, e.nSort
         """
         return self._fetchall(sql)
 
     def get_attribute_values(self) -> List[Dict[str, Any]]:
-        sql = """
+        sql = f"""
             SELECT
-                ew.kEigenschaftWert     AS jtl_id,
-                ew.kEigenschaft         AS jtl_attribute_id,
-                COALESCE(ews.cName, ew.cName) AS name,
-                ew.nSort                AS sort_order
-            FROM dbo.tEigenschaftWert ew
-            LEFT JOIN dbo.tEigenschaftWertsprache ews
-                ON ews.kEigenschaftWert = ew.kEigenschaftWert AND ews.cISOSprache = 'ger'
+                ew.kEigenschaftWert             AS jtl_id,
+                ew.kEigenschaft                 AS jtl_attribute_id,
+                COALESCE(ews.cName, ew.cArtNr, '') AS name,
+                ew.nSort                        AS sort_order
+            FROM dbo.teigenschaftwert ew
+            LEFT JOIN dbo.tEigenschaftWertSprache ews
+                ON ews.kEigenschaftWert = ew.kEigenschaftWert AND ews.kSprache = {_LANG}
+            WHERE ew.cAktiv = 'Y'
             ORDER BY ew.kEigenschaft, ew.nSort
         """
         return self._fetchall(sql)
 
     def get_variant_combinations(self) -> List[Dict[str, Any]]:
+        """Maps variant child Artikel → attribute value combinations."""
         sql = """
             SELECT
-                ekw.kArtikel            AS jtl_variant_id,
+                a.kArtikel              AS jtl_variant_id,
                 ekw.kEigenschaftWert    AS jtl_attr_value_id,
-                ew.kEigenschaft         AS jtl_attribute_id
-            FROM dbo.tEigenschaftKombinationWert ekw
-            JOIN dbo.tEigenschaftWert ew ON ew.kEigenschaftWert = ekw.kEigenschaftWert
-            ORDER BY ekw.kArtikel
+                ekw.kEigenschaft        AS jtl_attribute_id
+            FROM dbo.tArtikel a
+            JOIN dbo.tEigenschaftKombiWert ekw
+                ON ekw.kEigenschaftKombi = a.kEigenschaftKombi
+            WHERE a.kEigenschaftKombi > 0
+              AND a.cAktiv = 'Y'
+            ORDER BY a.kArtikel
         """
         return self._fetchall(sql)
 
@@ -218,12 +261,19 @@ class JTLReader:
     # ------------------------------------------------------------------ #
 
     def get_price_groups(self) -> List[Dict[str, Any]]:
+        """Return distinct customer groups as price groups (no tPreisgruppe in this schema)."""
         sql = """
-            SELECT kPreisgruppe AS jtl_id, cName AS name
-            FROM dbo.tPreisgruppe
-            ORDER BY kPreisgruppe
+            SELECT
+                kKundenGruppe   AS jtl_id,
+                cName           AS name
+            FROM dbo.tKundenGruppe
+            ORDER BY kKundenGruppe
         """
-        return self._fetchall(sql)
+        try:
+            return self._fetchall(sql)
+        except Exception as exc:
+            logger.warning("  Could not fetch price groups: %s", exc)
+            return []
 
     def get_customer_prices(self) -> List[Dict[str, Any]]:
         sql = """
@@ -231,8 +281,7 @@ class JTLReader:
                 p.kPreis            AS jtl_id,
                 p.kArtikel          AS jtl_product_id,
                 p.kKunde            AS jtl_customer_id,
-                p.kPreisgruppe      AS jtl_pricegroup_id,
-                p.kKundengruppe     AS jtl_customergroup_id,
+                p.kKundenGruppe     AS jtl_pricegroup_id,
                 pp.nAnzahlAb        AS min_qty,
                 pp.fNettoPreis      AS price_unit,
                 pp.fRabatt          AS discount_pct
@@ -240,40 +289,44 @@ class JTLReader:
             JOIN dbo.tPreisDetail pp ON pp.kPreis = p.kPreis
             ORDER BY p.kArtikel, p.kKunde, pp.nAnzahlAb
         """
-        rows = self._fetchall(sql)
-        logger.info("  Custom price records found: %d", len(rows))
-        return rows
+        try:
+            rows = self._fetchall(sql)
+            logger.info("  Custom price records found: %d", len(rows))
+            return rows
+        except Exception as exc:
+            logger.warning("  Could not fetch customer prices: %s", exc)
+            return []
 
     # ------------------------------------------------------------------ #
     #  Customers                                                            #
     # ------------------------------------------------------------------ #
 
     def get_customers(self) -> List[Dict[str, Any]]:
-        filter_sql = "AND k.nAktiv = 1" if self.mig.active_customers_only else ""
+        filter_sql = "AND (k.cSperre = 'N' OR k.cSperre IS NULL)" if self.mig.active_customers_only else ""
         sql = f"""
             SELECT
                 k.kKunde                AS jtl_id,
                 k.cKundenNr             AS ref,
-                k.cFirma                AS company_name,
-                k.cVorname              AS firstname,
-                k.cNachname             AS lastname,
-                k.cMail                 AS email,
-                k.cTel                  AS phone,
-                k.cMobil                AS mobile,
-                k.cFax                  AS fax,
-                k.cUSTID                AS vat,
-                k.kKundengruppe         AS jtl_customergroup_id,
-                k.nAktiv                AS active,
+                a.cFirma                AS company_name,
+                a.cVorname              AS firstname,
+                a.cName                 AS lastname,
+                a.cMail                 AS email,
+                a.cTel                  AS phone,
+                a.cMobil                AS mobile,
+                a.cFax                  AS fax,
+                a.cUSTID                AS vat,
+                k.kKundenGruppe         AS jtl_customergroup_id,
+                CASE WHEN k.cSperre='N' OR k.cSperre IS NULL THEN 1 ELSE 0 END AS active,
                 k.dErstellt             AS create_date,
-                ka.cStrasse             AS street,
-                ka.cHausnummer          AS street2,
-                ka.cPLZ                 AS zip,
-                ka.cOrt                 AS city,
-                ka.cLand                AS country_code,
-                ka.cBundesland          AS state
-            FROM dbo.tKunde k
-            LEFT JOIN dbo.tKundenadresse ka
-                ON ka.kKunde = k.kKunde AND ka.nTyp = 1
+                a.cStrasse              AS street,
+                a.cZusatz               AS street2,
+                a.cPLZ                  AS zip,
+                a.cOrt                  AS city,
+                a.cISO                  AS country_code,
+                a.cBundesland           AS state
+            FROM dbo.tkunde k
+            LEFT JOIN dbo.tAdresse a
+                ON a.kKunde = k.kKunde AND a.nTyp = 1
             WHERE 1=1 {filter_sql}
             ORDER BY k.kKunde
         """
@@ -289,46 +342,47 @@ class JTLReader:
         date_filter = ""
         params: dict = {}
         if self.mig.order_date_from:
-            date_filter += " AND b.dErstellt >= :date_from"
+            date_filter += " AND a.dErstellt >= :date_from"
             params["date_from"] = self.mig.order_date_from
         if self.mig.order_date_to:
-            date_filter += " AND b.dErstellt <= :date_to"
+            date_filter += " AND a.dErstellt <= :date_to"
             params["date_to"] = self.mig.order_date_to
 
         sql = f"""
             SELECT
-                b.kBestellung           AS jtl_id,
-                b.cBestellNr            AS name,
-                b.kKunde                AS jtl_customer_id,
-                b.dErstellt             AS date_order,
-                b.fGesamtbetragNetto    AS amount_untaxed,
-                b.fGesamtbetragBrutto   AS amount_total,
-                b.fVersandkostenNetto   AS shipping_cost,
-                b.cStatus               AS state,
-                b.cKommentar            AS note,
-                b.cVersandartName       AS carrier_name,
-                b.cZahlungsartName      AS payment_method,
-                lk.cFirma               AS ship_company,
-                lk.cVorname             AS ship_firstname,
-                lk.cNachname            AS ship_lastname,
-                lk.cStrasse             AS ship_street,
-                lk.cHausnummer          AS ship_street2,
-                lk.cPLZ                 AS ship_zip,
-                lk.cOrt                 AS ship_city,
-                lk.cLand                AS ship_country_code,
-                rk.cFirma               AS bill_company,
-                rk.cVorname             AS bill_firstname,
-                rk.cNachname            AS bill_lastname,
-                rk.cStrasse             AS bill_street,
-                rk.cHausnummer          AS bill_street2,
-                rk.cPLZ                 AS bill_zip,
-                rk.cOrt                 AS bill_city,
-                rk.cLand                AS bill_country_code
-            FROM dbo.tBestellung b
-            LEFT JOIN dbo.tLieferadresse lk ON lk.kBestellung = b.kBestellung
-            LEFT JOIN dbo.tRechnungsadresse rk ON rk.kBestellung = b.kBestellung
-            WHERE b.nStorniert = 0 {date_filter}
-            ORDER BY b.dErstellt DESC
+                a.kAuftrag                  AS jtl_id,
+                a.cAuftragsNr               AS name,
+                a.kKunde                    AS jtl_customer_id,
+                a.dErstellt                 AS date_order,
+                COALESCE(e.fWertNetto, 0)   AS amount_untaxed,
+                COALESCE(e.fWertBrutto, 0)  AS amount_total,
+                vs.cName                    AS state,
+                a.kVorgangsstatus           AS jtl_status_id,
+                -- shipping address (nTyp=2)
+                ls.cFirma                   AS ship_company,
+                ls.cVorname                 AS ship_firstname,
+                ls.cName                    AS ship_lastname,
+                ls.cStrasse                 AS ship_street,
+                ls.cZusatz                  AS ship_street2,
+                ls.cPLZ                     AS ship_zip,
+                ls.cOrt                     AS ship_city,
+                ls.cISO                     AS ship_country_code,
+                -- billing address (nTyp=1)
+                lb.cFirma                   AS bill_company,
+                lb.cVorname                 AS bill_firstname,
+                lb.cName                    AS bill_lastname,
+                lb.cStrasse                 AS bill_street,
+                lb.cZusatz                  AS bill_street2,
+                lb.cPLZ                     AS bill_zip,
+                lb.cOrt                     AS bill_city,
+                lb.cISO                     AS bill_country_code
+            FROM Verkauf.tAuftrag a
+            LEFT JOIN Verkauf.tAuftragEckdaten e ON e.kAuftrag = a.kAuftrag
+            LEFT JOIN Verkauf.tVorgangsstatus vs  ON vs.kVorgangsstatus = a.kVorgangsstatus
+            LEFT JOIN Verkauf.tAuftragAdresse ls  ON ls.kAuftrag = a.kAuftrag AND ls.nTyp = 2
+            LEFT JOIN Verkauf.tAuftragAdresse lb  ON lb.kAuftrag = a.kAuftrag AND lb.nTyp = 1
+            WHERE a.nStorno = 0 {date_filter}
+            ORDER BY a.dErstellt DESC
         """
         rows = self._fetchall(sql, params)
         logger.info("  Orders found: %d", len(rows))
@@ -341,39 +395,50 @@ class JTLReader:
         params = {f"id{i}": v for i, v in enumerate(order_ids)}
         sql = f"""
             SELECT
-                bp.kBestellPos          AS jtl_id,
-                bp.kBestellung          AS jtl_order_id,
-                bp.kArtikel             AS jtl_product_id,
-                bp.cArtNr               AS default_code,
-                bp.cName                AS product_name,
-                bp.nAnzahl              AS product_qty,
-                bp.fVKPreisNetto        AS price_unit,
-                bp.fRabatt              AS discount,
-                bp.fMwSt                AS tax_rate,
-                bp.cEAN                 AS barcode,
-                bp.nPosTyp              AS line_type    -- 1=Artikel, 2=Versand, 3=Gutschein
-            FROM dbo.tBestellungPos bp
-            WHERE bp.kBestellung IN ({placeholders})
-            ORDER BY bp.kBestellung, bp.kBestellPos
+                ap.kAuftragPosition     AS jtl_id,
+                ap.kAuftrag             AS jtl_order_id,
+                ap.kArtikel             AS jtl_product_id,
+                ap.cArtNr               AS default_code,
+                ap.cName                AS product_name,
+                ap.fAnzahl              AS product_qty,
+                ap.fVkNetto             AS price_unit,
+                ap.fRabatt              AS discount,
+                ap.fMwSt                AS tax_rate,
+                ap.nType                AS line_type    -- 1=Artikel, 0=Textposition
+            FROM Verkauf.tAuftragPosition ap
+            WHERE ap.kAuftrag IN ({placeholders})
+            ORDER BY ap.kAuftrag, ap.nSort
         """
         return self._fetchall(sql, params)
 
     # ------------------------------------------------------------------ #
-    #  Product Images                                                       #
+    #  Product Images (binary stored in DB)                                #
     # ------------------------------------------------------------------ #
 
     def get_product_images(self) -> List[Dict[str, Any]]:
+        """Returns image metadata. Use get_image_data(kBild) for binary content."""
         sql = """
             SELECT
-                ab.kArtikelBild         AS jtl_id,
-                ab.kArtikel             AS jtl_product_id,
-                ab.nSort                AS sort_order,
-                ab.cPfad                AS image_path,
-                ab.cPfadGross           AS image_path_large
-            FROM dbo.tArtikelBild ab
-            ORDER BY ab.kArtikel, ab.nSort
+                abp.kArtikelbildPlattform   AS jtl_id,
+                abp.kBild                   AS kBild,
+                abp.kArtikel                AS jtl_product_id,
+                abp.nNr                     AS sort_order
+            FROM dbo.tArtikelbildPlattform abp
+            WHERE abp.kShop = 0 AND abp.kPlattform = 0
+            ORDER BY abp.kArtikel, abp.nNr
         """
         return self._fetchall(sql)
+
+    def get_image_data(self, kBild: int) -> Optional[str]:
+        """Fetch binary image for a single kBild; returns base64 string or None."""
+        sql = "SELECT bBild FROM dbo.tBild WHERE kBild = :kBild"
+        try:
+            rows = self._fetchall(sql, {"kBild": kBild})
+            if rows and rows[0]["bBild"]:
+                return base64.b64encode(bytes(rows[0]["bBild"])).decode()
+        except Exception as exc:
+            logger.debug("  Image load failed kBild=%d: %s", kBild, exc)
+        return None
 
     # ------------------------------------------------------------------ #
     #  Manufacturers                                                        #
@@ -383,6 +448,7 @@ class JTLReader:
         sql = """
             SELECT kHersteller AS jtl_id, cName AS name, cHomepage AS website
             FROM dbo.tHersteller
+            WHERE cName IS NOT NULL AND cName != ''
             ORDER BY cName
         """
         return self._fetchall(sql)
@@ -401,4 +467,7 @@ class JTLReader:
             LEFT JOIN dbo.tSteuersatz ss
                 ON ss.kSteuerklasse = sk.kSteuerklasse AND ss.kSteuerzone = 1
         """
-        return self._fetchall(sql)
+        try:
+            return self._fetchall(sql)
+        except Exception:
+            return []

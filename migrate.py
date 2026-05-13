@@ -191,7 +191,7 @@ def run(args):
 
         if "images" in modules:
             images = reader.get_product_images()
-            stats["images"] = writer.import_images(images, args.image_dir)
+            stats["images"] = writer.import_images(images, args.image_dir, reader=reader)
 
     finally:
         reader.disconnect()
